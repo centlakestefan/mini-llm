@@ -1,0 +1,18 @@
+# build output
+build/
+*.exe
+*.obj
+*.lib
+*.exp
+*.pdb
+*.ilk
+
+# Visual Studio
+.vs/
+*.vcxproj.user
+
+# model weights — download separately (see README)
+stories15M.bin
+
+# tooling / local
+.claude/
