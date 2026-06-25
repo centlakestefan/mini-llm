@@ -43,6 +43,17 @@ run [-v] [prompt] [temperature]
 
 Try `./run -v "Once upon a time"` to watch the model think token by token.
 
+## Run with Docker (no toolchain needed)
+
+Prefer not to install a compiler? Build and run it in a container. The image fetches the model itself, so there's nothing else to set up:
+
+```sh
+docker build -t mini-llm .
+docker run --rm mini-llm                        # default greedy story
+docker run --rm mini-llm -v "Once upon a time"  # per-token trace
+docker run --rm mini-llm "The dragon" 1.0       # sampled, your own prompt
+```
+
 ## Credits & prior work
 
 This engine is modeled on Andrej Karpathy's [llama2.c](https://github.com/karpathy/llama2.c) — the single-file C inference approach this whole project follows. The model, `stories15M`, is one of Karpathy's TinyStories checkpoints, trained on the **TinyStories** dataset by **Ronen Eldan and Yuanzhi Li** (Microsoft Research). The architecture and tokenizer follow **Meta's Llama**. I rebuilt the engine from scratch to understand it — but the path was theirs first.

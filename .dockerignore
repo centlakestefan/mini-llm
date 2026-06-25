@@ -1,0 +1,11 @@
+# the model is downloaded inside the image; don't ship it (or build junk) as context
+stories15M.bin
+build/
+.vs/
+.git/
+.claude/
+*.exe
+*.obj
+*.lib
+*.exp
+*.pdb
