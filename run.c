@@ -1,14 +1,13 @@
-/* run.c — a tiny llama.cpp-style inference engine, built step by step.
+/* run.c — a tiny llama.cpp-style inference engine, written from scratch in C.
  *
- * STEP 5: Sampling + the autoregressive generation loop. Everything comes
- * together: encode a prompt, run forward token by token, sample the next token
- * from the logits, decode, repeat. The 15M model writes a little story.
+ * Loads a TinyStories model (Llama architecture) and generates text on the CPU:
+ * tokenize a prompt, run the transformer forward one token at a time, sample the
+ * next token from the logits, decode, repeat. The 15M model writes a little story.
  *
- * EXTENSION: Gated DeltaNet linear attention (run with `--deltanet`). This is
- * the layer type Qwen3.6 uses for 3 of every 4 layers. stories15M has NO trained
- * DeltaNet weights, so we initialize them randomly and demonstrate the MECHANISM
- * and its fixed-size recurrent state (which is why it scales to huge contexts) —
- * the numeric output is not meaningful text.
+ * Usage:  run [-v] [prompt] [temperature]
+ *   -v            print a per-token trace (prefill/decode markers + confidence)
+ *   prompt        text to continue (default: "Once upon a time")
+ *   temperature   0 = greedy (default, deterministic); >0 samples, e.g. 1.0
  */
 
 #include <stdio.h>
@@ -226,9 +225,10 @@ static void softmax(float *x, int size) {
     for (int i = 0; i < size; i++) x[i] /= sum;
 }
 
-/* The attention half of every transformer block, for one token at `pos`.
- * After this runs, s->x has had each layer's attention output added in.
- * (3c will insert the FFN after attention in each layer, and a classifier.) */
+/* The full forward pass for one token at position `pos`: embedding lookup, then
+ * each layer (RMSNorm -> attention with RoPE + KV cache -> residual, then
+ * RMSNorm -> SwiGLU feed-forward -> residual), and finally a RMSNorm + classifier
+ * that leaves the next-token logits in s->logits. */
 static void forward(Transformer *t, int token, int pos) {
     Config *c = &t->config;
     TransformerWeights *w = &t->weights;
