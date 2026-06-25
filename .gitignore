@@ -16,3 +16,8 @@ stories15M.bin
 
 # tooling / local
 .claude/
+
+# CUDA port — held back for a follow-up post (kept locally + in git history)
+run_cuda.cu
+gpu_check.cu
+gpu_matmul.cu
