@@ -23,6 +23,8 @@
 #include <string.h>
 #include <math.h>
 #include <time.h>
+#include <ctype.h>
+#include <limits.h>
 
 #define QWN2_MAGIC 0x716E3277u   /* "qwn2", little-endian, marks the v2 format */
 
@@ -51,6 +53,7 @@ typedef struct {
     float rms_eps;    /* RMSNorm epsilon (1e-5 legacy, 1e-6 for Qwen)           */
     int rope_neox;    /* 1 = HF rotate-half RoPE; 0 = llama2.c interleaved      */
     int has_qkv_bias; /* 1 = add per-head q/k/v bias (Qwen); 0 = none           */
+    int v2;           /* 1 = v2 "qwn2" chat model; 0 = legacy story model       */
 } Config;
 
 /* ---- pointers into the big weight buffer, one per tensor ----
@@ -167,7 +170,7 @@ static void read_checkpoint(const char *path, Transformer *t) {
         c->n_kv_heads = h[6]; c->vocab_size = h[7]; c->seq_len = h[8]; c->head_dim = h[9];
         shared_weights = h[10];
         memcpy(&c->rope_theta, &h[11], sizeof(float));
-        c->rms_eps = 1e-6f; c->rope_neox = 1; c->has_qkv_bias = 1;
+        c->rms_eps = 1e-6f; c->rope_neox = 1; c->has_qkv_bias = 1; c->v2 = 1;
         header_bytes = 48;
     } else {
         /* legacy llama2.c header: 7 int32 (28 bytes); sign of vocab = tied. */
@@ -178,6 +181,7 @@ static void read_checkpoint(const char *path, Transformer *t) {
         if (c->vocab_size < 0) c->vocab_size = -c->vocab_size;
         c->head_dim = c->dim / c->n_heads;
         c->rope_theta = 10000.0f; c->rms_eps = 1e-5f; c->rope_neox = 0; c->has_qkv_bias = 0;
+        c->v2 = 0;
         header_bytes = 28;
     }
 
@@ -543,6 +547,277 @@ static void encode(Tokenizer *t, char *text, int bos, int eos, int *tokens, int 
     free(buf);
 }
 
+/* ===================== Qwen byte-level BPE tokenizer ===================== */
+/* GPT-2 style: map every raw byte to a printable "byte-unicode" char, split
+ * text with Qwen's pre-tokenizer regex, then merge pieces by learned rank.
+ * Loaded from qwen_tokenizer.bin (see export_tokenizer.py). */
+
+/* --- a tiny open-addressing string->int hash map (keys are not owned) --- */
+typedef struct { const char *key; int val; } HEntry;
+typedef struct { HEntry *e; int cap; } HMap;
+
+static unsigned long long fnv1a(const char *s, int len) {
+    unsigned long long h = 1469598103934665603ULL;
+    for (int i = 0; i < len; i++) { h ^= (unsigned char)s[i]; h *= 1099511628211ULL; }
+    return h;
+}
+static void hmap_init(HMap *m, int cap) { m->cap = cap; m->e = calloc(cap, sizeof(HEntry)); }
+static void hmap_put(HMap *m, const char *key, int val) {
+    int i = (int)(fnv1a(key, (int)strlen(key)) % (unsigned)m->cap);
+    while (m->e[i].key) i = (i + 1) % m->cap;
+    m->e[i].key = key; m->e[i].val = val;
+}
+/* look up a (possibly non-terminated) key of given length */
+static int hmap_get(HMap *m, const char *key, int len) {
+    int i = (int)(fnv1a(key, len) % (unsigned)m->cap);
+    while (m->e[i].key) {
+        if ((int)strlen(m->e[i].key) == len && memcmp(m->e[i].key, key, len) == 0)
+            return m->e[i].val;
+        i = (i + 1) % m->cap;
+    }
+    return -1;
+}
+
+typedef struct {
+    char **vocab;          /* id -> byte-unicode string ("" for unused ids) */
+    int vocab_size;
+    char **merge_str;      /* rank -> "left right" string                   */
+    int n_merges;
+    char **spec_str;       /* special token contents                        */
+    int *spec_id;
+    int *spec_len;
+    int n_special;
+    HMap vocab2id;         /* byte-unicode piece -> id                      */
+    HMap merge2rank;       /* "left right" -> rank                          */
+    int byte_to_cp[256];   /* GPT-2 byte -> unicode codepoint               */
+    int cp_to_byte[1024];  /* and back (-1 if none)                         */
+} QTokenizer;
+
+static int qt_is_space(int cp){ return cp==' '||cp=='\t'||cp=='\n'||cp=='\r'||cp==0x0b||cp==0x0c; }
+static int qt_is_digit(int cp){ return cp>='0' && cp<='9'; }
+/* \p{L} approximation: ASCII letters plus any non-ASCII codepoint */
+static int qt_is_letter(int cp){ return (cp>='A'&&cp<='Z')||(cp>='a'&&cp<='z')||cp>=0x80; }
+static int qt_is_punct(int cp){ return !qt_is_space(cp)&&!qt_is_letter(cp)&&!qt_is_digit(cp); }
+
+/* decode one UTF-8 codepoint from s[p..L); set *adv to bytes consumed */
+static int utf8_next(const unsigned char *s, int L, int p, int *adv) {
+    unsigned char c = s[p];
+    if (c < 0x80) { *adv = 1; return c; }
+    if ((c >> 5) == 0x6 && p+1 < L) { *adv = 2; return ((c&0x1f)<<6)|(s[p+1]&0x3f); }
+    if ((c >> 4) == 0xe && p+2 < L) { *adv = 3; return ((c&0x0f)<<12)|((s[p+1]&0x3f)<<6)|(s[p+2]&0x3f); }
+    if ((c >> 3) == 0x1e && p+3 < L) { *adv = 4; return ((c&0x07)<<18)|((s[p+1]&0x3f)<<12)|((s[p+2]&0x3f)<<6)|(s[p+3]&0x3f); }
+    *adv = 1; return c;
+}
+/* encode a codepoint (< 0x800 here) as UTF-8; return bytes written */
+static int utf8_enc(int cp, char *out) {
+    if (cp < 0x80) { out[0] = (char)cp; return 1; }
+    out[0] = (char)(0xC0 | (cp >> 6)); out[1] = (char)(0x80 | (cp & 0x3f)); return 2;
+}
+
+static char *read_lenstr(FILE *f) {
+    int len; if (fread(&len, 4, 1, f) != 1) { fprintf(stderr, "bad tokenizer\n"); exit(1); }
+    char *s = malloc(len + 1);
+    if (len) fread(s, 1, len, f);
+    s[len] = '\0';
+    return s;
+}
+
+static void qt_build(QTokenizer *t, const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) { fprintf(stderr, "could not open '%s' (run export_tokenizer.py)\n", path); exit(1); }
+    char magic[4]; fread(magic, 1, 4, f);
+    if (memcmp(magic, "QTK1", 4) != 0) { fprintf(stderr, "bad tokenizer magic\n"); exit(1); }
+    fread(&t->vocab_size, 4, 1, f);
+    fread(&t->n_merges, 4, 1, f);
+    fread(&t->n_special, 4, 1, f);
+
+    t->vocab = malloc(t->vocab_size * sizeof(char *));
+    hmap_init(&t->vocab2id, 1 << 19);
+    for (int i = 0; i < t->vocab_size; i++) {
+        t->vocab[i] = read_lenstr(f);
+        if (t->vocab[i][0] != '\0') hmap_put(&t->vocab2id, t->vocab[i], i);
+    }
+    t->merge_str = malloc(t->n_merges * sizeof(char *));
+    hmap_init(&t->merge2rank, 1 << 19);
+    for (int i = 0; i < t->n_merges; i++) {
+        t->merge_str[i] = read_lenstr(f);
+        hmap_put(&t->merge2rank, t->merge_str[i], i);
+    }
+    t->spec_str = malloc(t->n_special * sizeof(char *));
+    t->spec_id  = malloc(t->n_special * sizeof(int));
+    t->spec_len = malloc(t->n_special * sizeof(int));
+    for (int i = 0; i < t->n_special; i++) {
+        t->spec_str[i] = read_lenstr(f);
+        fread(&t->spec_id[i], 4, 1, f);
+        t->spec_len[i] = (int)strlen(t->spec_str[i]);
+    }
+    fclose(f);
+
+    /* GPT-2 bytes<->unicode: printable bytes map to themselves, the rest to
+     * 256, 257, ... so every byte becomes a single printable codepoint. */
+    for (int i = 0; i < 1024; i++) t->cp_to_byte[i] = -1;
+    for (int b = 0; b < 256; b++)
+        t->byte_to_cp[b] = ((b>=0x21&&b<=0x7e)||(b>=0xa1&&b<=0xac)||(b>=0xae&&b<=0xff)) ? b : -1;
+    int n = 0;
+    for (int b = 0; b < 256; b++) if (t->byte_to_cp[b] == -1) t->byte_to_cp[b] = 256 + n++;
+    for (int b = 0; b < 256; b++) t->cp_to_byte[t->byte_to_cp[b]] = b;
+}
+
+/* BPE-encode one pre-token (raw bytes), appending token ids to ids[]. */
+static void bpe_piece(QTokenizer *t, const char *bytes, int blen, int *ids, int *n) {
+    if (blen == 0) return;
+    /* map raw bytes -> byte-unicode buffer u; each byte is one symbol */
+    char *u = malloc(blen * 2 + 1);
+    int *off = malloc(blen * sizeof(int));
+    int *len = malloc(blen * sizeof(int));
+    int ulen = 0, nsym = 0;
+    for (int i = 0; i < blen; i++) {
+        off[nsym] = ulen;
+        ulen += utf8_enc(t->byte_to_cp[(unsigned char)bytes[i]], u + ulen);
+        len[nsym] = ulen - off[nsym];
+        nsym++;
+    }
+    char *key = malloc(blen * 2 + 2);   /* scratch for "left right" lookups */
+
+    while (nsym > 1) {
+        int best_rank = INT_MAX, best = -1;
+        for (int i = 0; i < nsym - 1; i++) {
+            int kl = 0;
+            memcpy(key + kl, u + off[i], len[i]);   kl += len[i];
+            key[kl++] = ' ';
+            memcpy(key + kl, u + off[i+1], len[i+1]); kl += len[i+1];
+            int rank = hmap_get(&t->merge2rank, key, kl);
+            if (rank >= 0 && rank < best_rank) { best_rank = rank; best = i; }
+        }
+        if (best < 0) break;
+        len[best] += len[best+1];                   /* symbols are contiguous in u */
+        for (int j = best+1; j < nsym-1; j++) { off[j] = off[j+1]; len[j] = len[j+1]; }
+        nsym--;
+    }
+    for (int i = 0; i < nsym; i++) {
+        int id = hmap_get(&t->vocab2id, u + off[i], len[i]);
+        if (id >= 0) ids[(*n)++] = id;
+    }
+    free(u); free(off); free(len); free(key);
+}
+
+/* Pre-tokenize a special-token-free segment (Qwen's regex), BPE each piece. */
+static void qt_encode_segment(QTokenizer *t, const char *seg, int slen, int *ids, int *n) {
+    int i = 0;
+    while (i < slen) {
+        int adv; int cp = utf8_next((const unsigned char *)seg, slen, i, &adv);
+        int start = i;
+
+        /* 's 't 're 've 'm 'll 'd  (case-insensitive) */
+        if (cp == '\'' && i + 1 < slen) {
+            char la = (char)tolower((unsigned char)seg[i+1]);
+            char lb = (i + 2 < slen) ? (char)tolower((unsigned char)seg[i+2]) : 0;
+            int take = 0;
+            if ((la=='r'&&lb=='e')||(la=='v'&&lb=='e')||(la=='l'&&lb=='l')) take = 2;
+            else if (la=='s'||la=='t'||la=='m'||la=='d') take = 1;
+            if (take) { bpe_piece(t, seg+start, 1+take, ids, n); i += 1+take; continue; }
+        }
+        /* letters (\p{L}+) */
+        if (qt_is_letter(cp)) {
+            i += adv;
+            while (i < slen) { int a; int c = utf8_next((const unsigned char *)seg, slen, i, &a);
+                               if (qt_is_letter(c)) i += a; else break; }
+            bpe_piece(t, seg+start, i-start, ids, n); continue;
+        }
+        /* one leading non-CRLF/non-letter/non-digit char then letters */
+        if (cp != '\r' && cp != '\n' && !qt_is_digit(cp)) {
+            int a; int j = i + adv;
+            if (j < slen) { int c = utf8_next((const unsigned char *)seg, slen, j, &a);
+                if (qt_is_letter(c)) {
+                    int k = j;
+                    while (k < slen) { int a2; int c2 = utf8_next((const unsigned char *)seg, slen, k, &a2);
+                                       if (qt_is_letter(c2)) k += a2; else break; }
+                    bpe_piece(t, seg+start, k-start, ids, n); i = k; continue;
+                }
+            }
+        }
+        /* single digit (\p{N}) */
+        if (qt_is_digit(cp)) { bpe_piece(t, seg+start, adv, ids, n); i += adv; continue; }
+
+        /* optional leading space then punctuation run then trailing newlines */
+        {
+            int k = i, ok = 0;
+            if (cp == ' ' && i + adv < slen) {
+                int a; int c = utf8_next((const unsigned char *)seg, slen, i+adv, &a);
+                if (qt_is_punct(c)) { ok = 1; k = i + adv; }
+            }
+            if (!ok && qt_is_punct(cp)) { ok = 1; k = i; }
+            if (ok) {
+                int m = k;
+                while (m < slen) { int a; int c = utf8_next((const unsigned char *)seg, slen, m, &a);
+                                   if (qt_is_punct(c)) m += a; else break; }
+                while (m < slen && (seg[m]=='\r' || seg[m]=='\n')) m++;
+                bpe_piece(t, seg+start, m-start, ids, n); i = m; continue;
+            }
+        }
+        /* whitespace run (\s+); hand the last space to the next token if it
+         * is followed by a letter or punctuation (GPT-2 leading-space rule) */
+        {
+            int e = i;
+            while (e < slen) { int a; int c = utf8_next((const unsigned char *)seg, slen, e, &a);
+                               if (qt_is_space(c)) e += a; else break; }
+            if (e < slen && seg[e-1] == ' ' && (e-1) > i) {
+                int a; int c = utf8_next((const unsigned char *)seg, slen, e, &a);
+                if (qt_is_letter(c) || qt_is_punct(c)) {
+                    bpe_piece(t, seg+start, (e-1)-start, ids, n); i = e-1; continue;
+                }
+            }
+            bpe_piece(t, seg+start, e-i, ids, n); i = e; continue;
+        }
+    }
+}
+
+/* Encode full text to token ids, splitting on special tokens first. */
+static void qt_encode(QTokenizer *t, const char *text, int *ids, int *n) {
+    int L = (int)strlen(text), p = 0;
+    *n = 0;
+    while (p < L) {
+        int bs = -1, bi = -1, blen = 0;
+        for (int s = p; s < L; s++) {
+            for (int k = 0; k < t->n_special; k++)
+                if (s + t->spec_len[k] <= L && memcmp(text+s, t->spec_str[k], t->spec_len[k]) == 0
+                    && t->spec_len[k] > blen) { bs = s; bi = k; blen = t->spec_len[k]; }
+            if (bs == s) break;       /* earliest match wins (longest at that spot) */
+        }
+        if (bs >= 0) {
+            if (bs > p) qt_encode_segment(t, text+p, bs-p, ids, n);
+            ids[(*n)++] = t->spec_id[bi];
+            p = bs + blen;
+        } else {
+            qt_encode_segment(t, text+p, L-p, ids, n);
+            break;
+        }
+    }
+}
+
+/* Decode one token id to raw bytes (appended to out); returns bytes written.
+ * Maps byte-unicode codepoints back to the original bytes. */
+static int qt_decode(QTokenizer *t, int id, char *out) {
+    if (id < 0 || id >= t->vocab_size) return 0;
+    const unsigned char *s = (const unsigned char *)t->vocab[id];
+    int L = (int)strlen((const char *)s), p = 0, o = 0;
+    while (p < L) {
+        int adv; int cp = utf8_next(s, L, p, &adv); p += adv;
+        int b = (cp >= 0 && cp < 1024) ? t->cp_to_byte[cp] : -1;
+        if (b >= 0) out[o++] = (char)b;
+    }
+    return o;
+}
+
+static void qt_free(QTokenizer *t) {
+    for (int i = 0; i < t->vocab_size; i++) free(t->vocab[i]);
+    for (int i = 0; i < t->n_merges; i++) free(t->merge_str[i]);
+    for (int i = 0; i < t->n_special; i++) free(t->spec_str[i]);
+    free(t->vocab); free(t->merge_str); free(t->spec_str);
+    free(t->spec_id); free(t->spec_len);
+    free(t->vocab2id.e); free(t->merge2rank.e);
+}
+
 /* ================================= sampler ================================= */
 
 typedef struct { float prob; int index; } ProbIndex;
@@ -718,25 +993,112 @@ static void run_probe(Transformer *t, int *ids, int n_ids, int steps) {
     printf("\n");
 }
 
+/* =============================== chat (Qwen) =============================== */
+
+#define QWEN_IM_START 151644
+#define QWEN_IM_END   151645
+#define QWEN_EOT      151643
+
+/* Interactive ChatML loop. The KV cache persists across turns, so the model
+ * sees the whole conversation; `pos` is the running position in that cache. */
+static void chat(Transformer *t, QTokenizer *tok, Sampler *sampler) {
+    int max_seq = t->config.seq_len;
+    const char *SYSTEM = "You are Qwen, created by Alibaba Cloud. You are a helpful assistant.";
+
+    size_t cap = 1 << 16;
+    char *line = malloc(cap);
+    char *prompt = malloc(cap + 256);
+    int *ids = malloc((cap + 64) * sizeof(int));
+    char piece[256];   /* one token can decode to many raw bytes */
+    int pos = 0, turn = 0;
+
+    printf("\nQwen2.5-1.5B-Instruct chat. Type a message; /exit or Ctrl+Z to quit.\n");
+
+    while (1) {
+        printf("\n> ");
+        fflush(stdout);
+        if (!fgets(line, (int)cap, stdin)) break;
+        int ln = (int)strlen(line);
+        while (ln > 0 && (line[ln-1] == '\n' || line[ln-1] == '\r')) line[--ln] = '\0';
+        if (ln == 0) continue;
+        if (strcmp(line, "/exit") == 0 || strcmp(line, "/quit") == 0) break;
+
+        /* wrap the user turn in ChatML; the first turn carries the system prompt,
+         * later turns open with a newline to separate them in the cache */
+        if (turn == 0)
+            snprintf(prompt, cap + 256,
+                "<|im_start|>system\n%s<|im_end|>\n<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n",
+                SYSTEM, line);
+        else
+            snprintf(prompt, cap + 256,
+                "\n<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n", line);
+        turn++;
+
+        int n = 0;
+        qt_encode(tok, prompt, ids, &n);
+        if (pos + n + 1 >= max_seq) { printf("[context window full, ending chat]\n"); break; }
+
+        /* prefill: feed the prompt tokens, leaving logits that predict the reply */
+        for (int i = 0; i < n; i++) { forward(t, ids[i], pos); pos++; }
+
+        /* decode the assistant's reply until <|im_end|> / <|endoftext|> */
+        while (pos < max_seq) {
+            int next = sample(sampler, t->state.logits);
+            forward(t, next, pos);   /* advance the cache with the chosen token */
+            pos++;
+            if (next == QWEN_IM_END || next == QWEN_EOT) break;
+            int b = qt_decode(tok, next, piece);
+            fwrite(piece, 1, b, stdout);
+            fflush(stdout);
+        }
+        printf("\n");
+    }
+    free(line); free(prompt); free(ids);
+    printf("\nbye.\n");
+}
+
 int main(int argc, char **argv) {
     const char *checkpoint = "stories15M.bin";
     char *prompt = "Once upon a time";
     char *probe_ids = NULL;
+    char *encode_text = NULL;
     float temperature = 0.0f;   /* greedy by default: deterministic & reproducible */
     float topp = 0.9f;
     unsigned long long seed = 1234ULL;
     int verbose = 0;
     int probe_steps = 32;
 
-    /* args: [-v] [-m model] [-probe "ids"] [-n steps] [prompt] [temperature] */
+    /* args: [-v] [-m model] [-probe "ids"] [-n steps] [-encode "text"] [prompt] [temp] */
     int positional = 0;
     for (int a = 1; a < argc; a++) {
         if (strcmp(argv[a], "-v") == 0) verbose = 1;
         else if (strcmp(argv[a], "-m") == 0 && a + 1 < argc) checkpoint = argv[++a];
         else if (strcmp(argv[a], "-probe") == 0 && a + 1 < argc) probe_ids = argv[++a];
         else if (strcmp(argv[a], "-n") == 0 && a + 1 < argc) probe_steps = atoi(argv[++a]);
+        else if (strcmp(argv[a], "-encode") == 0 && a + 1 < argc) encode_text = argv[++a];
         else if (positional == 0) { prompt = argv[a]; positional++; }
         else if (positional == 1) { temperature = (float)atof(argv[a]); positional++; }
+    }
+
+    /* -encode: tokenize text with the Qwen tokenizer and print ids (no model).
+     * "-encode -" reads UTF-8 text from stdin (argv is ANSI-mangled on Windows). */
+    if (encode_text) {
+        char *buf = encode_text;
+        if (strcmp(encode_text, "-") == 0) {
+            size_t cap = 4096, len = 0; buf = malloc(cap);
+            int ch;
+            while ((ch = fgetc(stdin)) != EOF) {
+                if (len + 1 >= cap) { cap *= 2; buf = realloc(buf, cap); }
+                buf[len++] = (char)ch;
+            }
+            buf[len] = '\0';
+        }
+        QTokenizer qt; qt_build(&qt, "qwen_tokenizer.bin");
+        int *ids = malloc((strlen(buf) + 16) * sizeof(int)), n = 0;
+        qt_encode(&qt, buf, ids, &n);
+        for (int i = 0; i < n; i++) printf("%d%s", ids[i], i + 1 < n ? "," : "\n");
+        free(ids); qt_free(&qt);
+        return 0;
     }
 
     Transformer t;
@@ -766,21 +1128,29 @@ int main(int argc, char **argv) {
         return 0;
     }
 
-    Tokenizer tok;
-    build_tokenizer(&tok, "tokenizer.bin", c->vocab_size);
-
     Sampler sampler;
     build_sampler(&sampler, c->vocab_size, temperature, topp, seed);
 
-    if (temperature == 0.0f)
-        printf("\nprompt: \"%s\"  (greedy)\n", prompt);
-    else
-        printf("\nprompt: \"%s\"  (temperature=%.2f, top-p=%.2f)\n", prompt, temperature, topp);
-    printf("--------------------------------------------------\n");
-    generate(&t, &tok, &sampler, prompt, c->seq_len, verbose);
+    if (c->v2) {
+        /* a real chat model: ChatML conversation loop with the Qwen tokenizer */
+        QTokenizer qt;
+        qt_build(&qt, "qwen_tokenizer.bin");
+        chat(&t, &qt, &sampler);
+        qt_free(&qt);
+    } else {
+        /* a legacy story model: continue the prompt with the SentencePiece tokenizer */
+        Tokenizer tok;
+        build_tokenizer(&tok, "tokenizer.bin", c->vocab_size);
+        if (temperature == 0.0f)
+            printf("\nprompt: \"%s\"  (greedy)\n", prompt);
+        else
+            printf("\nprompt: \"%s\"  (temperature=%.2f, top-p=%.2f)\n", prompt, temperature, topp);
+        printf("--------------------------------------------------\n");
+        generate(&t, &tok, &sampler, prompt, c->seq_len, verbose);
+        free_tokenizer(&tok);
+    }
 
     free_sampler(&sampler);
-    free_tokenizer(&tok);
     free_transformer(&t);
     return 0;
 }

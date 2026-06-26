@@ -14,6 +14,7 @@ build/
 # model weights — download/convert separately (see README)
 stories15M.bin
 qwen.bin
+qwen_tokenizer.bin
 qwen_model/
 *.safetensors
 
