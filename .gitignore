@@ -11,8 +11,11 @@ build/
 .vs/
 *.vcxproj.user
 
-# model weights — download separately (see README)
+# model weights — download/convert separately (see README)
 stories15M.bin
+qwen.bin
+qwen_model/
+*.safetensors
 
 # tooling / local
 .claude/
