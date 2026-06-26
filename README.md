@@ -4,6 +4,10 @@ A tiny [llama.cpp](https://github.com/ggerganov/llama.cpp)-style LLM **inference
 
 Built as a learning project: every step — tokenizer (BPE), embeddings, RoPE, multi-head attention with a KV cache, the SwiGLU feed-forward network, and sampling — is plain, commented C in a single file (`run.c`).
 
+## Writeup
+
+There's a companion blog post: [In the head of an agent](https://taptomatic.com/blog/in-the-head-of-an-agent). It follows a single token on its way through the model — from the tokenizer that turns text into ids, through the embedding lookup, RoPE, the attention layers and KV cache, and the feed-forward network, out to the sampler that picks the next token — explaining the inner workings of each step along the way.
+
 ## Get the model
 
 The model weights aren't checked in (they're 60 MB). Download them next to the source:
