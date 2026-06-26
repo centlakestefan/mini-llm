@@ -274,7 +274,14 @@ static void rmsnorm(float *o, float *x, float *weight, int size, float eps) {
  * This single function performs every learned projection in the network and is
  * where essentially all the compute lives. */
 static void matmul(float *xout, float *x, float *w, int n, int d) {
-    for (int i = 0; i < d; i++) {
+    /* Each output row is independent, so parallelizing the outer loop keeps the
+     * result bit-identical (the inner sum order is unchanged). Build with
+     * /openmp (MSVC) or -fopenmp (gcc/clang) to use it; otherwise single-thread. */
+    int i;
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+#endif
+    for (i = 0; i < d; i++) {
         float val = 0.0f;
         for (int j = 0; j < n; j++)
             val += w[(long long)i * n + j] * x[j];
